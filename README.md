@@ -58,7 +58,21 @@ npm run dev
 The dashboard is served at http://localhost:5173 (Vite dev server proxies `/api`
 to the backend on port 8000).
 
+## API (implemented so far)
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| POST | `/api/repo/upload` | Ingest a repository from a `.zip` archive (multipart `file` field) |
+| POST | `/api/repo/clone` | Ingest a repository by cloning a remote URL (`{"url": "..."}`) |
+| GET | `/api/repo/list` | List ingested repositories and their ingestion status |
+| GET | `/api/repo/{repo_id}` | Status and metadata for one repository |
+| DELETE | `/api/repo/{repo_id}` | Delete a repository and its workspace data |
+
+Ingestion runs asynchronously: both POST endpoints return `202` with the repo record
+immediately, then poll `/api/repo/{repo_id}` until `status` becomes `ready` or `error`
+(`stage` reports progress: `queued → extracting|cloning → verifying`).
+
 ## Status
 
-Scaffolding stage — backend routers and metric modules are stubs; the frontend is a
-Vite + Tailwind boilerplate. Features are being added incrementally.
+Step 2 of 6 — ingestion pipeline (zip upload + URL clone, multi-repo registry) implemented.
+Git log parsing, metric computation and the dashboard UI are still pending.
