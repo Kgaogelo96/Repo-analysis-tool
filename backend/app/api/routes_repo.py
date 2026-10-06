@@ -243,5 +243,6 @@ def delete_repo(repo_id: str) -> None:
     record = _require(repo_id)
     state.registry().remove(repo_id)
     data_store.invalidate(repo_id)
+    aggregator.invalidate(repo_id)
     shutil.rmtree(record.path, ignore_errors=True)
     (config.uploads_dir() / f"{repo_id}.zip").unlink(missing_ok=True)
