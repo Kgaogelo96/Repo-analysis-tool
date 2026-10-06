@@ -32,7 +32,7 @@ def extract_zip(zip_path: Path, dest_dir: Path) -> Path:
     repo_root = find_repo_root(dest_dir)
     if repo_root is None:
         raise ZipIngestionError(
-            "no .git directory found in the archive; "
+            "no .git file or directory found in the archive; "
             "upload a zip containing a full Git repository"
         )
     return repo_root
@@ -40,12 +40,12 @@ def extract_zip(zip_path: Path, dest_dir: Path) -> Path:
 
 def find_repo_root(base: Path) -> Path | None:
     """Locate the directory holding `.git`: the root itself or a top-level child."""
-    if (base / ".git").is_dir():
+    if (base / ".git").exists():
         return base
     for child in sorted(path for path in base.iterdir() if path.is_dir()):
         if child.name in IGNORED_TOP_LEVEL:
             continue
-        if (child / ".git").is_dir():
+        if (child / ".git").exists():
             return child
     return None
 

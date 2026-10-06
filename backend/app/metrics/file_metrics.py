@@ -12,10 +12,11 @@ class FileStat:
     path: str
     added: int = 0
     removed: int = 0
-    last_ts: int | None = None  # newest author timestamp touching the file
+    last_ts: int | None = None  # newest committer timestamp touching the file
     commits: set[str] = field(default_factory=set)
     authors: set[Identity] = field(default_factory=set)
     binary_commits: set[str] = field(default_factory=set)
+    modifying: set[str] = field(default_factory=set)  # commits that changed lines (λ > 0)
 
     @property
     def churn(self) -> int:
@@ -40,6 +41,8 @@ def file_stats(selection: Selection) -> dict[str, FileStat]:
         else:
             stat.added += entry.added or 0
             stat.removed += entry.removed or 0
-        if stat.last_ts is None or entry.author_ts > stat.last_ts:
-            stat.last_ts = entry.author_ts
+        if (entry.added or 0) + (entry.removed or 0) > 0:
+            stat.modifying.add(entry.commit_hash)
+        if stat.last_ts is None or entry.committer_ts > stat.last_ts:
+            stat.last_ts = entry.committer_ts
     return stats

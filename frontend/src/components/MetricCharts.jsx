@@ -17,10 +17,11 @@ import {
   getMetricsSeries,
   getMetricsSummary,
   hQuery,
+  metricsState,
 } from '../api'
 import { formatNumber } from '../format'
 import { useFetch } from '../hooks'
-import { Card, Chip, EmptyState, ErrorNote, MiniBar, PendingNote, Spinner, metricsState } from '../ui'
+import { Card, Chip, EmptyState, ErrorNote, MiniBar, PendingNote, Spinner } from '../ui'
 
 const AXIS = { fill: '#94a3b8', fontSize: 11 }
 const TOOLTIP_STYLE = {
@@ -142,12 +143,11 @@ function SeriesPanel({ fetch, bucket, onBucketChange }) {
 
 function FilesPanel({ fetch, onDrillPath }) {
   const [sortKey, setSortKey] = useState('churn')
-  const rows = fetch.data?.files ?? []
   const sorted = useMemo(() => {
-    const copy = [...rows]
+    const copy = [...(fetch.data?.files ?? [])]
     copy.sort((a, b) => (b[sortKey] ?? -Infinity) - (a[sortKey] ?? -Infinity))
     return copy
-  }, [rows, sortKey])
+  }, [fetch.data, sortKey])
   const maxChurn = useMemo(() => Math.max(0, ...sorted.map((row) => row.churn ?? 0)), [sorted])
 
   const columns = [
@@ -164,7 +164,7 @@ function FilesPanel({ fetch, onDrillPath }) {
     <Card
       title="Top files"
       subtitle="Click a path to focus the dashboard on it"
-      right={<Chip tone="slate">top {rows.length || 25} by λ churn</Chip>}
+      right={<Chip tone="slate">top {sorted.length || 25} by λ churn</Chip>}
       bodyClassName="p-0"
     >
       <PanelBody fetch={fetch} endpoint="GET /api/metrics/{id}/files">

@@ -2,15 +2,21 @@
 __pycache__/
 *.py[cod]
 .venv/
-.pytest_cache/
 
 # Node
 node_modules/
 dist/
 .vite/
 
-# Runtime data (workspace fallback when /tmp is not writable)
+# Runtime data / ingested repository workspaces
 data/
+rat_workspace/
+backend/rat_workspace/
+
+# Test artifacts
+.pytest_cache/
+pytest-of-*/
+backend/pytest-of-*/
 
 # Scratch directories used during development
 .scratch/

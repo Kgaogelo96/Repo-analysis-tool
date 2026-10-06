@@ -8,7 +8,7 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app import config, data_store, state
-from app.git_engine import log_parser, runner
+from app.git_engine import author_merge, log_parser, runner
 from app.ingestion import clone_handler, zip_handler
 from app.metrics import aggregator
 
@@ -22,6 +22,16 @@ class CloneRequest(BaseModel):
         min_length=1,
         description="Remote repository URL (http(s), git, ssh or scp-style)",
     )
+
+
+class AuthorIdentityPayload(BaseModel):
+    name: str = ""
+    email: str = ""
+
+
+class AuthorMergeRequest(BaseModel):
+    target: AuthorIdentityPayload
+    sources: list[AuthorIdentityPayload] = Field(default_factory=list)
 
 
 def _derive_name(origin: str) -> str:
@@ -173,7 +183,7 @@ def list_commits(
 ) -> dict:
     """Parsed non-merge commits (newest first), with optional filters.
 
-    `since` is inclusive and `until` exclusive, both on author timestamps.
+    `since` is inclusive and `until` exclusive, both on committer timestamps.
     `author` is a case-insensitive substring matched against the canonical and
     raw name/email; `path` matches a file exactly or a directory prefix.
     """
@@ -186,17 +196,23 @@ def list_commits(
     offset = max(0, offset)
     limit = max(1, min(limit, 500))
     history = data_store.get_or_parse(repo_id, record.path)
+    manual_merges = author_merge.resolver(repo_id)
 
     author_query = author.strip().lower() if author else None
     path_prefix = path.rstrip("/") + "/" if path else None
 
     selected = []
     for commit in history.commits:
-        if since is not None and commit.author_ts < since:
+        if since is not None and commit.committer_ts < since:
             continue
-        if until is not None and commit.author_ts >= until:
+        if until is not None and commit.committer_ts >= until:
             continue
-        identity = history.author_identity(commit)
+        identity = author_merge.resolve_author(
+            manual_merges,
+            commit.author_name,
+            commit.author_email,
+            history.author_identity(commit),
+        )
         if author_query:
             haystack = (
                 identity.name.lower(),
@@ -237,6 +253,39 @@ def list_commits(
     }
 
 
+@router.post("/{repo_id}/authors/merge")
+def merge_authors(repo_id: str, payload: AuthorMergeRequest) -> dict:
+    """Persist manual author merge rules for a ready repository."""
+    record = _require(repo_id)
+    if record.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail=f"repository is not ready yet (status: {record.status}, stage: {record.stage})",
+        )
+
+    target = author_merge.Identity(
+        name=payload.target.name.strip(),
+        email=payload.target.email.strip(),
+    )
+    sources = [
+        author_merge.Identity(name=source.name.strip(), email=source.email.strip())
+        for source in payload.sources
+        if source.name.strip() or source.email.strip()
+    ]
+    if not target.name and not target.email:
+        raise HTTPException(status_code=400, detail="target author identity is required")
+    if not sources:
+        raise HTTPException(status_code=400, detail="at least one source identity is required")
+
+    rules = author_merge.save_rule(repo_id, target, sources)
+    aggregator.invalidate(repo_id)
+    return {
+        "target": {"name": target.name, "email": target.email},
+        "sources": [{"name": source.name, "email": source.email} for source in sources],
+        "rules": rules,
+    }
+
+
 @router.delete("/{repo_id}", status_code=204)
 def delete_repo(repo_id: str) -> None:
     """Remove a repository from the registry and delete its workspace data."""
@@ -244,5 +293,6 @@ def delete_repo(repo_id: str) -> None:
     state.registry().remove(repo_id)
     data_store.invalidate(repo_id)
     aggregator.invalidate(repo_id)
+    author_merge.delete_rules(repo_id)
     shutil.rmtree(record.path, ignore_errors=True)
     (config.uploads_dir() / f"{repo_id}.zip").unlink(missing_ok=True)

@@ -5,7 +5,7 @@ import {
   Loader2,
   RefreshCw,
 } from 'lucide-react'
-import { apiError, isMissingEndpoint } from './api'
+import { apiError } from './api'
 
 /** Panel with an optional header row (title, subtitle, right-side actions). */
 export function Card({ title, subtitle, right, children, className = '', bodyClassName = '' }) {
@@ -142,11 +142,6 @@ export function PendingNote({ endpoint, onRetry, compact = false }) {
       </div>
     </div>
   )
-}
-
-/** When a fetch 404s because the metrics engine has not landed it yet. */
-export function metricsState(error) {
-  return isMissingEndpoint(error) ? 'pending' : 'failed'
 }
 
 /** Horizontal magnitude bar used in tables and the directory tree. */

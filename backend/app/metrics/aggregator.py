@@ -7,6 +7,7 @@ raw commit list.
 import threading
 from dataclasses import dataclass, field
 
+from app.git_engine import author_merge
 from app.git_engine.log_parser import ParsedHistory
 from app.git_engine.mailmap import Identity
 
@@ -17,7 +18,8 @@ class Entry:
 
     commit_hash: str
     author_ts: int
-    author: Identity  # canonical (mailmap-resolved)
+    committer_ts: int
+    author: Identity  # canonical (mailmap + manual-merge resolved)
     raw_name: str
     raw_email: str
     path: str
@@ -38,6 +40,7 @@ class CommitSummary:
 
     hash: str
     author_ts: int
+    committer_ts: int
     author: Identity
     raw_name: str
     raw_email: str
@@ -67,11 +70,13 @@ class HistoryAggregate:
 class Filters:
     """Commit-set selection, mirroring the /commits endpoint semantics."""
 
-    since: int | None = None  # inclusive, author timestamp
-    until: int | None = None  # exclusive, author timestamp
+    since: int | None = None  # inclusive, committer timestamp
+    until: int | None = None  # exclusive, committer timestamp
     author: str | None = None  # case-insensitive substring, canonical or raw
     path: str | None = None  # exact file path or directory prefix
     hashes: frozenset[str] | None = None  # full-or-short hash whitelist
+    from_index: int | None = None  # 0-based position in the newest-first log (inclusive)
+    to_index: int | None = None  # exclusive end position of the log slice
 
 
 @dataclass(slots=True)
@@ -83,12 +88,16 @@ class Selection:
     path: str | None  # the path filter, if any (drives commit counting)
 
 
-def build_aggregate(history: ParsedHistory) -> HistoryAggregate:
+def build_aggregate(
+    history: ParsedHistory,
+    manual_merges: dict[tuple[str, str], Identity] | None = None,
+) -> HistoryAggregate:
     """Aggregate a parsed history in a single pass.
 
-    Identity resolution and path strings are memoized so mailmap rules run
-    once per distinct raw author and repeated file paths stay shared.
+    Identity resolution and path strings are memoized so mailmap/manual-merge
+    rules run once per distinct raw author and repeated file paths stay shared.
     """
+    manual_merges = manual_merges or {}
     identities: dict[tuple[str, str], Identity] = {}
     paths: dict[str, str] = {}
     commits: list[CommitSummary] = []
@@ -101,7 +110,10 @@ def build_aggregate(history: ParsedHistory) -> HistoryAggregate:
         key = (commit.author_name, commit.author_email)
         author = identities.get(key)
         if author is None:
-            author = identities[key] = history.author_identity(commit)
+            canonical = history.author_identity(commit)
+            author = identities[key] = author_merge.resolve_author(
+                manual_merges, commit.author_name, commit.author_email, canonical
+            )
             if author not in seen:
                 seen.add(author)
                 authors.append(author)
@@ -109,6 +121,7 @@ def build_aggregate(history: ParsedHistory) -> HistoryAggregate:
             CommitSummary(
                 hash=commit.hash,
                 author_ts=commit.author_ts,
+                committer_ts=commit.committer_ts,
                 author=author,
                 raw_name=commit.author_name,
                 raw_email=commit.author_email,
@@ -123,6 +136,7 @@ def build_aggregate(history: ParsedHistory) -> HistoryAggregate:
             entry = Entry(
                 commit_hash=commit.hash,
                 author_ts=commit.author_ts,
+                committer_ts=commit.committer_ts,
                 author=author,
                 raw_name=commit.author_name,
                 raw_email=commit.author_email,
@@ -148,22 +162,42 @@ def build_aggregate(history: ParsedHistory) -> HistoryAggregate:
 def select(aggregate: HistoryAggregate, filters: Filters) -> Selection:
     """Apply the shared filter semantics to an aggregate.
 
-    Commit-level filters (time, author, hashes) select whole commits; the
-    path filter additionally narrows which of a commit's entries count.
+    The commit-set selector follows the dashboard contract's precedence:
+    explicit hashes win over a newest-first log-slice interval, which wins
+    over a time window. `author` narrows whichever set remains, and the path
+    filter additionally narrows which of a commit's entries count.
     """
     author_query = filters.author.strip().lower() if filters.author else None
     prefix = filters.path.rstrip("/") + "/" if filters.path else None
     hashes = filters.hashes or None
 
+    allowed: set[str] | None = None  # when set, only these commit hashes survive
+    window = False
+    if hashes is not None:
+        allowed = {
+            summary.hash
+            for summary in aggregate.commits
+            if any(summary.hash.startswith(h) for h in hashes)
+        }
+    elif filters.from_index is not None or filters.to_index is not None:
+        total = len(aggregate.commits)
+        start = max(0, filters.from_index or 0)
+        end = total if filters.to_index is None else min(max(filters.to_index, start), total)
+        allowed = {summary.hash for summary in aggregate.commits[start:end]}
+    else:
+        window = True
+
     commits: list[CommitSummary] = []
     entries: list[Entry] = []
     for summary in aggregate.commits:
-        if filters.since is not None and summary.author_ts < filters.since:
-            continue
-        if filters.until is not None and summary.author_ts >= filters.until:
-            continue
-        if hashes is not None and not any(summary.hash.startswith(h) for h in hashes):
-            continue
+        if allowed is not None:
+            if summary.hash not in allowed:
+                continue
+        elif window:
+            if filters.since is not None and summary.committer_ts < filters.since:
+                continue
+            if filters.until is not None and summary.committer_ts >= filters.until:
+                continue
         if author_query is not None:
             haystack = (
                 summary.author.name.lower(),
@@ -211,7 +245,7 @@ def get_or_build(repo_id: str, history: ParsedHistory) -> HistoryAggregate:
         cached = _cache.get(repo_id)
         if cached is not None and cached[0] == history.head:
             return cached[1]
-        aggregate = build_aggregate(history)
+        aggregate = build_aggregate(history, author_merge.resolver(repo_id))
         _cache[repo_id] = (history.head, aggregate)
         return aggregate
 

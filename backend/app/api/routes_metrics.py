@@ -15,12 +15,13 @@ def _safe_text(value: str) -> str:
     """Re-encode surrogate-escaped text (e.g. invalid-UTF-8 paths) as valid UTF-8.
 
     The log parser round-trips undecodable bytes with `surrogateescape`; such
-    strings crash JSON serialization, so they are repaired at the API boundary.
+    strings crash JSON serialization, so they are repaired at the API boundary
+    by restoring the raw bytes and re-decoding with U+FFFD replacements.
     """
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
-        return value.encode("utf-8", "replace").decode("utf-8")
+        return value.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
     return value
 
 
@@ -53,6 +54,8 @@ def _select(
     author: str | None,
     path: str | None,
     hashes: str | None,
+    from_index: int | None = None,
+    to_index: int | None = None,
 ) -> aggregator.Selection:
     aggregate = _load(repo_id)
     filters = aggregator.Filters(
@@ -61,22 +64,37 @@ def _select(
         author=author,
         path=path,
         hashes=_hash_set(hashes),
+        from_index=from_index,
+        to_index=to_index,
     )
     return aggregator.select(aggregate, filters)
 
 
-def _file_row(stat: file_metrics.FileStat) -> dict:
+def _file_row(stat: file_metrics.FileStat, commit_count: int) -> dict:
+    modifications = len(stat.modifying)
     return {
         "path": _safe_text(stat.path),
-        "commits": len(stat.commits),
         "added": stat.added,
         "removed": stat.removed,
-        "churn": stat.churn,
         "growth": stat.growth,
+        "churn": stat.churn,
+        "modifications": modifications,
+        "frequency": round(modifications / commit_count, 4) if commit_count else 0.0,
+        "churn_rate": round(stat.churn / commit_count, 4) if commit_count else 0.0,
+        "commits": len(stat.commits),
         "binary_commits": len(stat.binary_commits),
         "authors": len(stat.authors),
         "last_ts": stat.last_ts,
     }
+
+
+def _sanitize_tree(node: dict) -> dict:
+    """Repair surrogate-escaped names/paths through a serialized tree in place."""
+    node["name"] = _safe_text(node["name"])
+    node["path"] = _safe_text(node["path"])
+    for child in node.get("children", ()):
+        _sanitize_tree(child)
+    return node
 
 
 def _sort_value(stat: file_metrics.FileStat, key: str):
@@ -98,9 +116,11 @@ def repo_summary(
     author: str | None = None,
     path: str | None = None,
     hashes: str | None = None,
+    from_index: int | None = None,
+    to_index: int | None = None,
 ) -> dict:
     """Totals and rates for the selected commit set."""
-    selection = _select(repo_id, since, until, author, path, hashes)
+    selection = _select(repo_id, since, until, author, path, hashes, from_index, to_index)
     return dir_metrics.commit_set_totals(selection)
 
 
@@ -112,22 +132,31 @@ def authors(
     author: str | None = None,
     path: str | None = None,
     hashes: str | None = None,
+    from_index: int | None = None,
+    to_index: int | None = None,
 ) -> dict:
     """Per-canonical-author churn, modifications and ownership (churn-descending)."""
-    selection = _select(repo_id, since, until, author, path, hashes)
-    stats = author_metrics.author_stats(selection)
+    selection = _select(repo_id, since, until, author, path, hashes, from_index, to_index)
+    ownership_selection = _select(repo_id, since, until, None, path, hashes, from_index, to_index)
+    ownership_total = sum((entry.added or 0) + (entry.removed or 0) for entry in ownership_selection.entries)
+    stats = author_metrics.author_stats(selection, ownership_total)
     return {
         "total": len(stats),
         "authors": [
             {
                 "name": _safe_text(stat.author.name),
                 "email": _safe_text(stat.author.email),
+                "raw": [
+                    {"name": _safe_text(raw_name), "email": _safe_text(raw_email)}
+                    for raw_name, raw_email in stat.raw
+                ],
                 "commits": len(stat.commits),
                 "files": len(stat.files),
                 "added": stat.added,
                 "removed": stat.removed,
                 "churn": stat.churn,
                 "growth": stat.growth,
+                "modifications": len(stat.modifying),
                 "first_ts": stat.first_ts,
                 "last_ts": stat.last_ts,
                 "ownership": round(stat.ownership, 4),
@@ -177,24 +206,27 @@ def files(
     author: str | None = None,
     path: str | None = None,
     hashes: str | None = None,
+    from_index: int | None = None,
+    to_index: int | None = None,
     sort: str = "churn",
     order: str = "desc",
     offset: int = 0,
     limit: int = FILES_LIMIT_DEFAULT,
 ) -> dict:
     """Flat per-file rows, sortable and paginated."""
-    selection = _select(repo_id, since, until, author, path, hashes)
+    selection = _select(repo_id, since, until, author, path, hashes, from_index, to_index)
     stats = list(file_metrics.file_stats(selection).values())
     key = sort if sort in _SORT_KEYS else "churn"
     stats.sort(key=lambda stat: _sort_value(stat, key), reverse=order.lower() != "asc")
     offset = max(0, offset)
     limit = max(1, min(limit, FILES_LIMIT_MAX))
     window = stats[offset : offset + limit]
+    commit_count = len(selection.commits)
     return {
         "total": len(stats),
         "offset": offset,
         "limit": limit,
-        "files": [_file_row(stat) for stat in window],
+        "files": [_file_row(stat, commit_count) for stat in window],
     }
 
 
@@ -206,15 +238,25 @@ def tree(
     author: str | None = None,
     path: str | None = None,
     hashes: str | None = None,
+    from_index: int | None = None,
+    to_index: int | None = None,
 ) -> dict:
-    """Nested directory rollup of churn and growth (dirs first, then files)."""
-    selection = _select(repo_id, since, until, author, path, hashes)
+    """Nested directory rollup (dirs first, then files).
+
+    `path` both narrows the selection and re-roots the returned node on that
+    directory, so the dashboard can drill into any subtree lazily.
+    """
+    selection = _select(repo_id, since, until, author, path, hashes, from_index, to_index)
     stats = file_metrics.file_stats(selection)
-    return {"tree": dir_metrics.directory_rollup(stats)}
+    commit_count = len(selection.commits)
+    root = dir_metrics.directory_rollup(stats, commit_count)
+    if path:
+        root = dir_metrics.find_node(root, path) or dir_metrics.empty_node(path)
+    return _sanitize_tree(root)
 
 
-@router.get("/{repo_id}/timeseries")
-def timeseries(
+@router.get("/{repo_id}/series")
+def series(
     repo_id: str,
     bucket: str = "month",
     since: int | None = None,
@@ -222,7 +264,9 @@ def timeseries(
     author: str | None = None,
     path: str | None = None,
     hashes: str | None = None,
+    from_index: int | None = None,
+    to_index: int | None = None,
 ) -> dict:
     """Bucketed churn/growth time series for the selected commit set."""
-    selection = _select(repo_id, since, until, author, path, hashes)
+    selection = _select(repo_id, since, until, author, path, hashes, from_index, to_index)
     return dir_metrics.timeseries(selection, bucket)

@@ -24,11 +24,17 @@ class _Node:
     commits: set[str] = field(default_factory=set)
     authors: set[Identity] = field(default_factory=set)
     binary_commits: set[str] = field(default_factory=set)
+    modifying: set[str] = field(default_factory=set)  # commits that changed lines (λ > 0)
     children: dict[str, "_Node"] = field(default_factory=dict)
 
 
-def directory_rollup(file_stats: dict[str, FileStat]) -> dict:
-    """Nest per-file stats into a directory tree (parent totals = subtree sums)."""
+def directory_rollup(file_stats: dict[str, FileStat], commit_count: int) -> dict:
+    """Nest per-file stats into a directory tree (parent totals = subtree sums).
+
+    `commit_count` (|H|) is the denominator for the per-node frequency and
+    churn-rate metrics; nodes are serialized in the dashboard's contract
+    shape: {name, path, kind, has_children, metrics, children}.
+    """
     root = _Node(name="", path="", is_file=False)
     for stat in file_stats.values():
         parts = stat.path.split("/")
@@ -50,7 +56,7 @@ def directory_rollup(file_stats: dict[str, FileStat]) -> dict:
         node.children[parts[-1]] = leaf
         _absorb(leaf, stat)
         leaf.files = 1
-    return _serialize(root)
+    return _serialize(root, commit_count)
 
 
 def _absorb(node: _Node, stat: FileStat) -> None:
@@ -59,31 +65,78 @@ def _absorb(node: _Node, stat: FileStat) -> None:
     node.commits.update(stat.commits)
     node.authors.update(stat.authors)
     node.binary_commits.update(stat.binary_commits)
+    node.modifying.update(stat.modifying)
     if stat.last_ts is not None and (node.last_ts is None or stat.last_ts > node.last_ts):
         node.last_ts = stat.last_ts
 
 
-def _serialize(node: _Node) -> dict:
+def _serialize(node: _Node, denom: int) -> dict:
+    """Contract shape for the dashboard tree: metrics nested per node."""
+    added, removed = node.added, node.removed
+    modifications = len(node.modifying)
+    is_file = node.is_file
     payload = {
-        "kind": "file" if node.is_file else "dir",
         "name": node.name,
         "path": node.path,
-        "commits": len(node.commits),
-        "authors": len(node.authors),
-        "binary_commits": len(node.binary_commits),
-        "added": node.added,
-        "removed": node.removed,
-        "churn": node.added + node.removed,
-        "growth": node.added - node.removed,
-        "last_ts": node.last_ts,
-        "files": 1 if node.is_file else node.files,
+        "kind": "file" if is_file else "dir",
+        "has_children": not is_file and bool(node.children),
+        "metrics": {
+            "files": 1 if is_file else node.files,
+            "added": added,
+            "removed": removed,
+            "growth": added - removed,
+            "churn": added + removed,
+            "modifications": modifications,
+            "frequency": round(modifications / denom, 4) if denom else 0.0,
+            "churn_rate": round((added + removed) / denom, 4) if denom else 0.0,
+            "authors": len(node.authors),
+            "commits": len(node.commits),
+            "binary_commits": len(node.binary_commits),
+            "last_ts": node.last_ts,
+        },
     }
-    if not node.is_file:
+    if not is_file:
         payload["children"] = [
-            _serialize(child)
+            _serialize(child, denom)
             for child in sorted(node.children.values(), key=lambda c: (c.is_file, c.name.lower()))
         ]
     return payload
+
+
+def find_node(node: dict, path: str) -> dict | None:
+    """Serialized descendant whose path equals `path` (for tree re-rooting)."""
+    if node["path"] == path:
+        return node
+    for child in node.get("children", ()):
+        found = find_node(child, path)
+        if found is not None:
+            return found
+    return None
+
+
+def empty_node(path: str) -> dict:
+    """Zeroed directory placeholder for a drilled path with no activity."""
+    return {
+        "name": path.rsplit("/", 1)[-1],
+        "path": path,
+        "kind": "dir",
+        "has_children": False,
+        "metrics": {
+            "files": 0,
+            "added": 0,
+            "removed": 0,
+            "growth": 0,
+            "churn": 0,
+            "modifications": 0,
+            "frequency": 0.0,
+            "churn_rate": 0.0,
+            "authors": 0,
+            "commits": 0,
+            "binary_commits": 0,
+            "last_ts": None,
+        },
+        "children": [],
+    }
 
 
 def commit_set_totals(selection: Selection) -> dict:
@@ -91,9 +144,16 @@ def commit_set_totals(selection: Selection) -> dict:
     counted = counted_commits(selection)
     added = sum(entry.added or 0 for entry in selection.entries)
     removed = sum(entry.removed or 0 for entry in selection.entries)
-    timestamps = [commit.author_ts for commit in counted]
-    commit_count = len(counted)
+    timestamps = [commit.committer_ts for commit in selection.commits]
+    commit_count = len(selection.commits)
     churn = added + removed
+    modifications = len(
+        {
+            entry.commit_hash
+            for entry in selection.entries
+            if (entry.added or 0) + (entry.removed or 0) > 0
+        }
+    )
     return {
         "commits": commit_count,
         "authors": len({commit.author for commit in counted}),
@@ -103,6 +163,9 @@ def commit_set_totals(selection: Selection) -> dict:
         "removed": removed,
         "churn": churn,
         "growth": added - removed,
+        "modifications": modifications,
+        "frequency": round(modifications / commit_count, 4) if commit_count else 0.0,
+        "churn_rate": round(churn / commit_count, 4) if commit_count else 0.0,
         "first_ts": min(timestamps) if timestamps else None,
         "last_ts": max(timestamps) if timestamps else None,
         "avg_churn_per_commit": round(churn / commit_count, 2) if commit_count else 0.0,
@@ -117,7 +180,7 @@ def timeseries(selection: Selection, bucket: str = "month") -> dict:
 
     buckets: dict[int, dict] = {}
     for entry in selection.entries:
-        start = _bucket_start(entry.author_ts, name)
+        start = _bucket_start(entry.committer_ts, name)
         point = buckets.get(start)
         if point is None:
             point = buckets[start] = {"commits": set(), "added": 0, "removed": 0}
@@ -129,8 +192,11 @@ def timeseries(selection: Selection, bucket: str = "month") -> dict:
     for start in sorted(buckets):
         raw = buckets[start]
         added, removed = raw["added"], raw["removed"]
+        moment = datetime.fromtimestamp(start, tz=timezone.utc)
+        key = f"{moment:%Y-%m}" if name == "month" else f"{moment:%Y-%m-%d}"
         points.append(
             {
+                "key": key,
                 "start_ts": start,
                 "commits": len(raw["commits"]),
                 "added": added,
@@ -139,7 +205,7 @@ def timeseries(selection: Selection, bucket: str = "month") -> dict:
                 "growth": added - removed,
             }
         )
-    return {"bucket": name, "bucket_seconds": BUCKET_SECONDS[name], "points": points}
+    return {"bucket": name, "bucket_seconds": BUCKET_SECONDS[name], "buckets": points}
 
 
 def _bucket_start(ts: int, name: str) -> int:

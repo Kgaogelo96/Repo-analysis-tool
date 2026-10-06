@@ -6,7 +6,7 @@ export const api = axios.create({ baseURL: '/api', timeout: 120000 })
 /**
  * INTEGRATION CONTRACT — every backend call in the dashboard goes through this
  * module. The selected commit set `H` is serialised as query parameters:
- *   - since / until : author timestamps in epoch seconds (since inclusive,
+ *   - since / until : committer timestamps in epoch seconds (since inclusive,
  *     until exclusive)  -> time-based H_t
  *   - from_index / to_index : 0-based positions in the newest-first git log
  *     (i inclusive, j exclusive)  -> interval H_{i,j}
@@ -61,6 +61,14 @@ export function isMissingEndpoint(error) {
     error?.response?.status === 404 &&
     error.response.data?.detail === 'Not Found'
   )
+}
+
+/**
+ * Classify a failed metrics fetch: 'pending' while the route itself has not
+ * landed yet (metrics engine still in progress), 'failed' otherwise.
+ */
+export function metricsState(error) {
+  return isMissingEndpoint(error) ? 'pending' : 'failed'
 }
 
 /** Drop empty values and serialise arrays/sets as comma-separated strings. */

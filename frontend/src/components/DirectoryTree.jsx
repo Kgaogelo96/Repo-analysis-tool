@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { ArrowLeft, ChevronDown, ChevronRight, File, Folder, FolderTree, Loader2, RefreshCw } from 'lucide-react'
-import { getMetricsTree, hQuery } from '../api'
+import { getMetricsTree, hQuery, metricsState } from '../api'
 import { formatNumber } from '../format'
 import { useFetch } from '../hooks'
-import { Card, EmptyState, ErrorNote, MiniBar, PendingNote, Spinner, metricsState } from '../ui'
+import { Card, EmptyState, ErrorNote, MiniBar, PendingNote, Spinner } from '../ui'
 
 const ROW_GRID = 'grid grid-cols-[minmax(0,1fr)_4.5rem_6.5rem_2.5rem] items-center gap-2'
 

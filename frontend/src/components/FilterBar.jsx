@@ -17,7 +17,7 @@ import { Chip, EmptyState, Spinner } from '../ui'
 
 const MODES = [
   { id: 'all', label: 'All', title: 'H = every non-merge commit on the branch (H_t unbounded)' },
-  { id: 'window', label: 'Time window', title: 'H_t — commits with author timestamp in [since, until)' },
+  { id: 'window', label: 'Time window', title: 'H_t — commits with committer timestamp in [since, until)' },
   { id: 'interval', label: 'Interval', title: 'H_{i,j} — commits at positions i..j-1 of the newest-first log' },
   { id: 'manual', label: 'Manual', title: 'An explicit set of commit hashes' },
 ]
@@ -173,7 +173,7 @@ export default function FilterBar({
                 onCommitSetChange({ ...commitSet, mode: 'window', since: toEpoch(event.target.value) })
               }}
               className={`${inputClass} [color-scheme:dark]`}
-              title="since (inclusive, author timestamp)"
+              title="since (inclusive, committer timestamp)"
             />
             <span>→</span>
             <input
