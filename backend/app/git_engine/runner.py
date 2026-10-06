@@ -23,14 +23,21 @@ def run_git(
     cwd: Path | str | None = None,
     timeout: int = DEFAULT_TIMEOUT,
     check: bool = True,
+    text: bool = True,
 ) -> subprocess.CompletedProcess:
+    """Run `git <args>` and capture stdout/stderr.
+
+    Pass `text=False` to receive raw bytes; required for `git log -z`, whose
+    output must not be decoded as one locale-dependent string (paths are
+    arbitrary byte sequences).
+    """
     try:
         proc = subprocess.run(
             ["git", *args],
             cwd=cwd,
             env=_git_env(),
             capture_output=True,
-            text=True,
+            text=text,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
@@ -38,9 +45,17 @@ def run_git(
     except FileNotFoundError as exc:
         raise GitError("git executable not found on PATH") from exc
     if check and proc.returncode != 0:
-        lines = [line for line in (proc.stderr or proc.stdout or "").splitlines() if line.strip()]
-        raise GitError(lines[-1].strip() if lines else f"git {' '.join(args)} failed")
+        raise GitError(_error_message(proc, args))
     return proc
+
+
+def _error_message(proc: subprocess.CompletedProcess, args: Sequence[str]) -> str:
+    """Last non-empty stderr line (or stdout), decoded best-effort, as error text."""
+    raw = proc.stderr or proc.stdout or b""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    return lines[-1] if lines else f"git {' '.join(args)} failed"
 
 
 def head_commit(repo_path: Path | str) -> str | None:

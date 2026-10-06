@@ -66,13 +66,27 @@ to the backend on port 8000).
 | POST | `/api/repo/clone` | Ingest a repository by cloning a remote URL (`{"url": "..."}`) |
 | GET | `/api/repo/list` | List ingested repositories and their ingestion status |
 | GET | `/api/repo/{repo_id}` | Status and metadata for one repository |
+| GET | `/api/repo/{repo_id}/commits` | Parsed non-merge commits (filters: `offset`, `limit`, `since`, `until`, `author`, `path`) |
 | DELETE | `/api/repo/{repo_id}` | Delete a repository and its workspace data |
 
 Ingestion runs asynchronously: both POST endpoints return `202` with the repo record
 immediately, then poll `/api/repo/{repo_id}` until `status` becomes `ready` or `error`
-(`stage` reports progress: `queued → extracting|cloning → verifying`).
+(`stage` reports progress: `queued → extracting|cloning → verifying → parsing`).
+
+## Tests
+
+```bash
+cd backend
+.venv/bin/python -m pytest
+```
+
+The suite builds synthetic repositories (non-merge history, `-M50%` rename with edits,
+pure rename, binary files, weird filenames, merge exclusion) and checks the parser and
+mailmap engine against `git rev-list` ground truth.
 
 ## Status
 
-Step 2 of 6 — ingestion pipeline (zip upload + URL clone, multi-repo registry) implemented.
-Git log parsing, metric computation and the dashboard UI are still pending.
+Step 3 of 6 — fast single-pass git log parser (non-merge commits, rename attribution to
+the new path, binary detection) with `.mailmap` author resolution, cached after ingestion
+and exposed via `/api/repo/{repo_id}/commits`. Metric computation and the dashboard UI
+are still pending.

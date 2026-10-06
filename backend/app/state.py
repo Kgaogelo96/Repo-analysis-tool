@@ -10,7 +10,8 @@ from app import config
 
 REGISTRY_FILENAME = "registry.json"
 
-# Statuses: queued -> processing (stages: extracting | cloning -> verifying) -> ready | error
+# Statuses: queued -> processing (stages: extracting | cloning -> verifying -> parsing)
+# -> ready | error
 
 
 def new_repo_id() -> str:
@@ -28,6 +29,7 @@ class RepoRecord:
     stage: str = ""  # human-readable progress detail while processing
     error: str | None = None
     head: str | None = None
+    commit_count: int | None = None  # non-merge commits reachable from HEAD
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def to_dict(self) -> dict:

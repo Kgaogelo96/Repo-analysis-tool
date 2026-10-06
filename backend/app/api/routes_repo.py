@@ -1,4 +1,4 @@
-"""Repository lifecycle endpoints: ingestion (zip/URL), listing and deletion."""
+"""Repository lifecycle endpoints: ingestion (zip/URL), listing, commits and deletion."""
 import re
 import shutil
 import threading
@@ -7,9 +7,10 @@ from pathlib import Path
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from app import config, state
-from app.git_engine import runner
+from app import config, data_store, state
+from app.git_engine import log_parser, runner
 from app.ingestion import clone_handler, zip_handler
+from app.metrics import aggregator
 
 router = APIRouter(prefix="/api/repo", tags=["repo"])
 
@@ -50,7 +51,17 @@ def _finalize(repo_id: str, root: Path) -> None:
     if head is None:
         _fail(repo_id, "could not resolve HEAD: the repository appears to be empty or corrupted")
         return
-    state.registry().update(repo_id, status="ready", stage="", error=None, head=head)
+    state.registry().update(repo_id, stage="parsing")
+    history = log_parser.parse_history(root)
+    data_store.put(repo_id, history)
+    state.registry().update(
+        repo_id,
+        status="ready",
+        stage="",
+        error=None,
+        head=head,
+        commit_count=len(history.commits),
+    )
 
 
 def _fail(repo_id: str, message: str) -> None:
@@ -150,10 +161,87 @@ def get_repo(repo_id: str) -> dict:
     return _require(repo_id).to_dict()
 
 
+@router.get("/{repo_id}/commits")
+def list_commits(
+    repo_id: str,
+    offset: int = 0,
+    limit: int = 200,
+    since: int | None = None,
+    until: int | None = None,
+    author: str | None = None,
+    path: str | None = None,
+) -> dict:
+    """Parsed non-merge commits (newest first), with optional filters.
+
+    `since` is inclusive and `until` exclusive, both on author timestamps.
+    `author` is a case-insensitive substring matched against the canonical and
+    raw name/email; `path` matches a file exactly or a directory prefix.
+    """
+    record = _require(repo_id)
+    if record.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail=f"repository is not ready yet (status: {record.status}, stage: {record.stage})",
+        )
+    offset = max(0, offset)
+    limit = max(1, min(limit, 500))
+    history = data_store.get_or_parse(repo_id, record.path)
+
+    author_query = author.strip().lower() if author else None
+    path_prefix = path.rstrip("/") + "/" if path else None
+
+    selected = []
+    for commit in history.commits:
+        if since is not None and commit.author_ts < since:
+            continue
+        if until is not None and commit.author_ts >= until:
+            continue
+        identity = history.author_identity(commit)
+        if author_query:
+            haystack = (
+                identity.name.lower(),
+                identity.email.lower(),
+                commit.author_name.lower(),
+                commit.author_email.lower(),
+            )
+            if not any(author_query in value for value in haystack):
+                continue
+        if path and not any(
+            change.path == path
+            or (path_prefix is not None and change.path.startswith(path_prefix))
+            for change in commit.changes
+        ):
+            continue
+        selected.append((commit, identity))
+
+    window = selected[offset : offset + limit]
+    return {
+        "total": len(selected),
+        "offset": offset,
+        "limit": limit,
+        "commits": [
+            {
+                "hash": commit.hash,
+                "author_ts": commit.author_ts,
+                "committer_ts": commit.committer_ts,
+                "author": {"name": identity.name, "email": identity.email},
+                "raw_author": {"name": commit.author_name, "email": commit.author_email},
+                "files_changed": len(commit.changes),
+                "binary_files": sum(1 for change in commit.changes if change.binary),
+                "added": commit.added,
+                "removed": commit.removed,
+                "churn": commit.churn,
+            }
+            for commit, identity in window
+        ],
+    }
+
+
 @router.delete("/{repo_id}", status_code=204)
 def delete_repo(repo_id: str) -> None:
     """Remove a repository from the registry and delete its workspace data."""
     record = _require(repo_id)
     state.registry().remove(repo_id)
+    data_store.invalidate(repo_id)
     shutil.rmtree(record.path, ignore_errors=True)
     (config.uploads_dir() / f"{repo_id}.zip").unlink(missing_ok=True)
